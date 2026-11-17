@@ -21,7 +21,7 @@ execute:
 This primer loads the cleaned management + lab dataset with the k7 zone
 assignments from Paper 1. It describes the variables, gives a brief look at
 the data by zone, and lays out the hypotheses and planned analyses for Paper 2.
-**No models are fit here.** The causal ML section is a plan only.
+ The causal ML section is a plan only.
 
 **Overarching question:** Are the k7 soil health zones useful and accurate
 benchmarks for soil health, for decision-makers and for farmers?
