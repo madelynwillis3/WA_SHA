@@ -1,0 +1,490 @@
+---
+title: "Paper 2 primer: management effects within WA soil health zones (k7)"
+subtitle: "Data load, variable guide, brief EDA, and analysis plan"
+author: "Madelyn Willis"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+---
+
+# Purpose
+
+This primer loads the cleaned management + lab dataset with the k7 zone
+assignments from Paper 1. It describes the variables, gives a brief look at
+the data by zone, and lays out the hypotheses and planned analyses for Paper 2.
+**No models are fit here.** The causal ML section is a plan only.
+
+**Overarching question:** Are the k7 soil health zones useful and accurate
+benchmarks for soil health, for decision-makers and for farmers?
+
+# Setup and data
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(knitr)
+
+# Paths are relative to code/; the CSV lives in data/
+data_path <- file.path("..", "data", "mnglabxymet_all_v8_withclusters.csv")
+
+raw <- read_csv(data_path, guess_max = 5000, show_col_types = FALSE)
+dim(raw)
+```
+
+## Cleaning decisions
+
+* **Zone 5 is dropped.** It has a single sample, so no within-zone analysis
+  is possible. Only 6 of the 7 k7 zones contain samples (zones 1, 2, 3, 4, 6;
+  zone 7 has none), leaving 5 usable zones.
+* `zone` is stored as a factor.
+* Yes/no management fields are converted to logical (`TRUE`/`FALSE`/`NA`).
+  `"unknown"` becomes `NA`.
+
+```{r}
+#| label: clean
+yn <- function(x) {
+  x <- str_to_lower(str_trim(x))
+  case_when(x %in% c("yes", "y") ~ TRUE,
+            x %in% c("no", "n")  ~ FALSE,
+            TRUE ~ NA)
+}
+
+dat <- raw |>
+  filter(Cluster_k7 != 5) |>
+  mutate(
+    zone           = factor(Cluster_k7),
+    plant_cycle    = factor(plant_cycle,
+                            levels = c("annual", "perennial", "uncultivated")),
+    texture_class  = factor(`texture_class.x`,
+                            levels = c("Coarse", "Medium", "Fine")),
+    sampling_depth = factor(sampling_depth),
+    across(c(till, cover_crop, organic_amendments, compost, manure,
+             livestock, irrigate),
+           yn, .names = "{.col}_yn")
+  )
+
+tibble(samples   = nrow(dat),
+       producers = n_distinct(dat$producer_id),
+       years     = paste(range(dat$year), collapse = "–"),
+       projects  = n_distinct(dat$file_names))
+```
+
+::: {.callout-warning}
+## Repeated samples
+`field_id` is a field number *within* a producer ("01", "02", …), not a
+unique field ID. Producer + field is unique for nearly every sample, so almost
+no fields were resampled. Repeats happen at the **producer** level: several
+fields per farm, sometimes in different years. Use `producer_id` as the
+grouping variable for random effects and for clustering standard errors.
+:::
+
+```{r}
+#| label: field-id-check
+dat |>
+  mutate(field_uid = paste(producer_id, field_id, sep = "_")) |>
+  summarise(samples = n(),
+            unique_fields = n_distinct(field_uid),
+            producers = n_distinct(producer_id),
+            max_samples_per_producer = max(table(producer_id)))
+```
+
+# Variable guide
+
+The CSV has 333 columns. Many are free-text survey fields or `.x`/`.y`
+duplicates from a join. The table below lists the variables this paper will
+actually use.
+
+```{r}
+#| label: var-guide
+var_guide <- tribble(
+  ~group, ~variable, ~description, ~role,
+  "Zone", "Cluster_k7 / zone", "k7 simple cluster from Paper 1 (SCORPAN-based k-means)", "Grouping / benchmark unit",
+  "Indicators: Paper 1", "toc_percent", "Total organic carbon (%)", "Response (H2, H3)",
+  "Indicators: Paper 1", "poxc_mg_kg", "Permanganate oxidizable C (mg/kg)", "Response (H2, H3)",
+  "Indicators: Paper 1", "ace_g_protein_kg_soil", "ACE protein (g/kg)", "Response (H2, H3)",
+  "Indicators: Paper 1", "pmn_28day_mg_kg", "Potentially mineralizable N, 28 d (mg/kg)", "Response (H2, H3)",
+  "Indicators: Paper 1", "min_c_96hr_mg_c_kg_day", "Mineralizable C, 96 h (mg C/kg/day)", "Response (H2, H3)",
+  "Indicators: new, related to zone inputs", "ph", "pH (lab); SOLUS mapped pH was a clustering input", "Response (H1)",
+  "Indicators: new, related to zone inputs", "bd_g_cm3", "Bulk density (g/cm3); SOLUS mapped BD was an input", "Response (H1)",
+  "Indicators: new, related to zone inputs", "cec_meq_100g", "CEC (meq/100 g); SOLUS mapped CEC/ECEC were inputs", "Response (H1)",
+  "Indicators: new, not used to build zones", "wsa_percent", "Water-stable aggregates (%)", "Response (H1)",
+  "Indicators: new, not used to build zones", "whc_in_ft", "Water-holding capacity (in/ft)", "Response (H1)",
+  "Indicators: new, not used to build zones", "total_n_percent", "Total N (%); correlated with TOC", "Response (H1)",
+  "Indicators: new, not used to build zones", "ec_mmhos_cm", "Electrical conductivity (mmhos/cm)", "Response (H1)",
+  "Indicators: new, not used to build zones", "p_olsen_mg_kg", "Olsen P (mg/kg)", "Response (H1)",
+  "Indicators: new, not used to build zones", "k_mg_kg", "K (mg/kg)", "Response (H1)",
+  "Indicators: new, not used to build zones", "s_mg_kg", "S (mg/kg)", "Response (H1)",
+  "Indicators: new, not used to build zones", "min_c_24hr_mg_c_kg_day", "Mineralizable C, 24 h (n ≈ 500; thin in zone 4)", "Response (H1)",
+  "Management", "till", "Any tillage (yes/no)", "Practice (H3)",
+  "Management", "cover_crop", "Cover crop used (yes/no)", "Practice (H3)",
+  "Management", "organic_amendments", "Any organic amendment (yes/no)", "Practice (H3)",
+  "Management", "compost / manure", "Compost or manure applied (yes/no)", "Practice (H3)",
+  "Management", "livestock", "Livestock integration (yes/no/unknown)", "Practice (H3)",
+  "Management", "irrigate", "Irrigated (yes/no)", "Covariate",
+  "Management (sparse)", "tillage_gtir_avg, gtir_calc", "Tillage intensity (GTIR); n ≈ 115–290", "Subset analysis only",
+  "Management (sparse)", "rotation_yrs, crop_diversity_index", "Rotation / diversity; n ≈ 110", "Subset analysis only",
+  "Crop", "plant_cycle", "annual / perennial / uncultivated", "Covariate; reference sites",
+  "Crop", "crop_group, crop_type", "18 groups / 65 types", "Covariate",
+  "Soil", "texture_class.x, clay_percent, sand_percent", "Lab texture", "Covariate",
+  "Climate (point)", "map_mm_year, mat_c", "Mean annual precip (mm), mean annual temp (°C)", "Describe zones",
+  "Sampling", "sampling_depth", "0–30 cm (most) vs 0–20 cm", "Covariate / sensitivity",
+  "Sampling", "year, sampling_month", "Sampling year 2016–2024, month", "Random effect / covariate",
+  "Sampling", "file_names", "Source project (12)", "Random effect",
+  "Sampling", "producer_id", "Producer (426); grouping for repeats", "Random effect",
+  "Reference-site history", "crop_plantdate", "Year current cover established (survey)", "Reference criteria",
+  "Reference-site history", "prior_landuse, other_info", "Free-text land-use history", "Reference criteria (manual)"
+)
+kable(var_guide)
+```
+
+### Indicator coverage by zone
+
+Indicators are kept for H1 only if every zone has reasonable n. Too sparse to
+use: beta-glucosidase, infiltration, penetration resistance, nematodes and
+microarthropods (0–4 samples in some zones).
+
+```{r}
+#| label: coverage
+p1_ind   <- c("toc_percent", "poxc_mg_kg", "ace_g_protein_kg_soil",
+              "pmn_28day_mg_kg", "min_c_96hr_mg_c_kg_day")
+built_ind <- c("ph", "bd_g_cm3", "cec_meq_100g")
+indep_ind <- c("wsa_percent", "whc_in_ft", "total_n_percent", "ec_mmhos_cm",
+               "p_olsen_mg_kg", "k_mg_kg", "s_mg_kg", "min_c_24hr_mg_c_kg_day")
+
+dat |>
+  group_by(zone) |>
+  summarise(n = n(), across(all_of(c(p1_ind, built_ind, indep_ind)),
+                            ~ sum(!is.na(.x)))) |>
+  pivot_longer(-zone) |>
+  pivot_wider(names_from = zone, names_prefix = "zone_")
+```
+
+# Brief EDA
+
+## Zone profiles
+
+```{r}
+#| label: zone-profile
+dat |>
+  group_by(zone) |>
+  summarise(
+    n               = n(),
+    producers       = n_distinct(producer_id),
+    MAP_mm          = median(map_mm_year, na.rm = TRUE),
+    MAT_C           = median(mat_c, na.rm = TRUE),
+    pct_annual      = mean(plant_cycle == "annual") * 100,
+    pct_perennial   = mean(plant_cycle == "perennial") * 100,
+    pct_uncult      = mean(plant_cycle == "uncultivated") * 100,
+    pct_coarse      = mean(texture_class == "Coarse", na.rm = TRUE) * 100,
+    pct_0_20cm      = mean(sampling_depth == "0-20 cm") * 100
+  ) |>
+  mutate(across(where(is.double), \(x) round(x, 1)))
+```
+
+## Figure 1: indicators by zone
+
+Two Paper 1 indicators (TOC, POXC) and four new indicators not used to build
+the zones. The y-axis is log scale and the dashed line is the statewide median.
+Zones sharing a letter are not significantly different (pairwise Wilcoxon
+rank-sum tests, Benjamini–Hochberg adjusted, α = 0.05). These are unadjusted,
+exploratory comparisons. Formal tests come from the mixed models in H1.
+
+```{r}
+
+#| label: fig-indicators
+#| fig-cap: "Selected soil health indicators by k7 zone (log scale). Dashed line = statewide median. Zones sharing a letter do not differ significantly (pairwise Wilcoxon, BH-adjusted, α = 0.05)."
+#| fig-width: 9
+#| fig-height: 6
+library(multcompView)
+
+fig1_vars <- c(
+  toc_percent     = "TOC (%)",
+  poxc_mg_kg      = "POXC (mg/kg)",
+  wsa_percent     = "Aggregate stability (%)",
+  total_n_percent = "Total N (%)",
+  ec_mmhos_cm     = "EC (mmhos/cm)",
+  p_olsen_mg_kg   = "Olsen P (mg/kg)"
+)
+
+long1 <- dat |>
+  select(zone, all_of(names(fig1_vars))) |>
+  pivot_longer(-zone, names_to = "var", values_to = "value") |>
+  filter(!is.na(value), value > 0) |>
+  mutate(var = factor(fig1_vars[var], levels = fig1_vars))
+
+meds <- long1 |> group_by(var) |> summarise(med = median(value))
+
+# Compact letter display from BH-adjusted pairwise Wilcoxon tests
+cld_letters <- function(df) {
+  pw <- pairwise.wilcox.test(df$value, df$zone,
+                             p.adjust.method = "BH", exact = FALSE)$p.value
+  pv <- c()
+  for (i in rownames(pw)) for (j in colnames(pw))
+    if (!is.na(pw[i, j])) pv[paste(j, i, sep = "-")] <- pw[i, j]
+  lt <- multcompLetters(pv, threshold = 0.05)$Letters
+  tibble(zone = factor(names(lt), levels = levels(df$zone)), letter = lt)
+}
+
+sig_labels <- long1 |>
+  group_by(var) |>
+  group_modify(~ cld_letters(.x)) |>
+  ungroup() |>
+  left_join(long1 |> group_by(var) |> summarise(ypos = max(value) * 1.6),
+            by = "var")
+
+# Overall Kruskal–Wallis test per indicator, for the text
+long1 |>
+  group_by(var) |>
+  summarise(kruskal_p = signif(kruskal.test(value ~ zone)$p.value, 3))
+
+ggplot(long1, aes(zone, value)) +
+  geom_hline(data = meds, aes(yintercept = med),
+             linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+  geom_boxplot(fill = "#BCD3F2", colour = "#1F4E9C", width = 0.6,
+               linewidth = 0.4, outlier.size = 0.6, outlier.alpha = 0.4) +
+  geom_text(data = sig_labels, aes(zone, ypos, label = letter),
+            size = 3.5, colour = "grey20") +
+  scale_y_log10(expand = expansion(mult = c(0.05, 0.12))) +
+  facet_wrap(~ var, scales = "free_y", ncol = 3) +
+  labs(x = "k7 zone", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0))
+```
+
+
+## Figure 2: management and crop composition by zone
+
+This figure shows the confounding that the design has to handle: practices and
+crop types aren't spread evenly across zones.
+
+```{r}
+#| label: fig-mgmt
+#| fig-cap: "Percent of samples in each zone reporting each practice or plant cycle (NA excluded from the denominator)."
+#| fig-width: 8
+#| fig-height: 4.5
+mgmt_labels <- c(
+  till_yn               = "Tillage",
+  cover_crop_yn         = "Cover crop",
+  organic_amendments_yn = "Organic amendment",
+  compost_yn            = "Compost",
+  manure_yn             = "Manure",
+  livestock_yn          = "Livestock",
+  irrigate_yn           = "Irrigated",
+  annual                = "Annual crop",
+  perennial             = "Perennial",
+  uncultivated          = "Uncultivated"
+)
+
+mgmt_pct <- dat |>
+  mutate(annual       = plant_cycle == "annual",
+         perennial    = plant_cycle == "perennial",
+         uncultivated = plant_cycle == "uncultivated") |>
+  select(zone, all_of(names(mgmt_labels))) |>
+  pivot_longer(-zone) |>
+  group_by(zone, name) |>
+  summarise(pct = mean(value, na.rm = TRUE) * 100,
+            n   = sum(!is.na(value)), .groups = "drop") |>
+  mutate(name = factor(mgmt_labels[name], levels = rev(mgmt_labels)))
+
+ggplot(mgmt_pct, aes(zone, name, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(aes(label = round(pct),
+                colour = pct > 55), size = 3.3, show.legend = FALSE) +
+  scale_fill_gradient(low = "#EEF3FB", high = "#1F4E9C",
+                      limits = c(0, 100), name = "% of samples") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey20")) +
+  labs(x = "k7 zone", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+### Practice sample sizes within zones
+
+For H3, a practice is tested within a zone only with **≥15 samples with the
+practice and ≥15 without**. Cells below that are flagged.
+
+```{r}
+#| label: practice-cells
+min_n <- 15
+dat |>
+  select(zone, ends_with("_yn")) |>
+  pivot_longer(-zone, names_to = "practice") |>
+  filter(!is.na(value)) |>
+  count(zone, practice, value) |>
+  pivot_wider(names_from = value, values_from = n, values_fill = 0,
+              names_prefix = "n_") |>
+  mutate(practice = str_remove(practice, "_yn"),
+         testable = n_TRUE >= min_n & n_FALSE >= min_n,
+         cell     = paste0(n_TRUE, " / ", n_FALSE, if_else(testable, "", " ✗"))) |>
+  select(practice, zone, cell) |>
+  pivot_wider(names_from = zone, values_from = cell, names_prefix = "zone_")
+```
+
+Cells read as *n with practice / n without*. ✗ = below the minimum.
+
+## Candidate reference (uncultivated) sites
+
+Reference sites are filtered in tiers. Tier 4 here counts **date-confirmed**
+sites only (≥10 years between `crop_plantdate` and sampling). Sites supported
+only by free text, and sites with no date, need manual review: use
+`reference_site_review.csv` and the collector contacts, or check NLCD and
+historical imagery once coordinates are available.
+
+```{r}
+#| label: reference
+est_year <- function(x) {
+  x <- str_to_lower(str_trim(x))
+  case_when(str_detect(x, "before") ~ 2000,
+            str_detect(x, "^(19|20)\\d{2}$") ~ suppressWarnings(as.numeric(x)),
+            TRUE ~ NA_real_)
+}
+
+unc <- dat |>
+  filter(plant_cycle == "uncultivated") |>
+  mutate(est      = est_year(crop_plantdate),
+         yrs      = year - est,
+         t1_nofallow = crop_group != "Fallow",
+         t2_notill   = t1_nofallow & till_yn %in% FALSE,
+         t3_noinputs = t2_notill & !(irrigate_yn %in% TRUE) &
+                       !(organic_amendments_yn %in% TRUE),
+         t4_dated10  = t3_noinputs & !is.na(yrs) & yrs >= 10,
+         t3_undated  = t3_noinputs & is.na(yrs))
+
+ref_tiers <- unc |>
+  group_by(zone = as.character(zone)) |>
+  summarise(all_uncultivated = n(),
+            `1_no_fallow`    = sum(t1_nofallow),
+            `2_no_till`      = sum(t2_notill),
+            `3_no_irr_amend` = sum(t3_noinputs),
+            `4_dated_10yr`   = sum(t4_dated10),
+            undated_to_review = sum(t3_undated))
+
+bind_rows(ref_tiers,
+          summarise(ref_tiers, zone = "Total", across(where(is.numeric), sum)))
+```
+
+Reference types also differ by zone (grazed native land, CRP, forest). Report
+reference type alongside any reference comparison, and consider excluding
+forest as an unrealistic target for cropland.
+
+```{r}
+#| label: reference-types
+unc |> filter(t3_noinputs) |> count(crop_type, zone) |>
+  pivot_wider(names_from = zone, values_from = n, values_fill = 0,
+              names_prefix = "zone_")
+```
+
+# Hypotheses and analysis plan
+
+## H1: Do the zones hold up with new indicators?
+
+**Hypothesis:** Soil health indicators not used in Paper 1 differ among the
+k7 zones, and the differences remain after accounting for crop and
+management. This tests the strength of the k7 zones, which were built from
+spatial data and validated with carbon-based indicators, using new information.
+
+* **Indicators, in two groups.**
+  * *Related to zone inputs* (pH, bulk density, CEC). Mapped SOLUS versions
+    of these were clustering inputs. The lab data are independent, so these
+    test whether mapped differences show up in the field.
+  * *Not used to build zones* (WSA, water-holding capacity, total N, EC,
+    Olsen P, K, S, Min-C 24 h). These are the stronger test: do the zones
+    capture properties they were never built on?
+* **Models**, per indicator:
+  * Unadjusted: `indicator ~ zone + (1|year) + (1|file_names) + (1|producer_id)`
+  * Adjusted: add `crop_group + plant_cycle + texture + sampling_depth +` main practices
+* **Report** zone F-statistics, η² or partial R², and how much the zone
+  effect shrinks after adjustment. Keep the metrics comparable to Paper 1.
+
+## H2: How do the zones differ, by how much, and why?
+
+**Question:** How do the zones differ in management, crop composition and soil
+health? By what size and direction, and what are the primary drivers
+(management, crop, soil, sampling)?
+
+**Expectation:** Zones differ strongly in management and crop composition
+(Figure 2). Once those are accounted for, the soil health differences
+attributable to zone itself may be smaller.
+
+* **Composition:** chi-square tests with Cramér's V for practices and crop
+  mix by zone.
+* **Size and direction:** standardized effect sizes or percent differences of
+  each zone vs. the statewide mean and vs. the other zones. Show as a
+  zone × indicator heatmap with direction.
+* **Drivers:** variance partitioning in the mixed models (partial R² or
+  commonality analysis) across zone, soil (texture), crop, management and
+  sampling.
+
+## H3: Do sustainable practices improve soil health within zones?
+
+**Question:** Within zones, do more sustainable practices (reduced tillage,
+cover crops, organic amendments, perennial cover, livestock integration)
+improve soil health indicators, even after accounting for differences in soil?
+How do managed fields compare with uncultivated reference sites?
+
+* **Mixed models with a practice × zone interaction**:
+  `indicator ~ practice * zone + texture + crop_group + sampling_depth + (1|year) + (1|file_names) + (1|producer_id)`.
+  The interaction tests whether practice effects differ by zone. Show
+  per-zone practice effects as forest plots.
+* **Testable cells only.** Use the ≥15 / ≥15 rule from the practice table above.
+* **Reference comparison (exploratory).** Express each field as a percentage of
+  its zone's median at the confirmed reference sites, and compare across
+  practice groups. Use strict (confirmed) references as the main analysis and
+  broad (tier 3) references as a sensitivity check. Keep it descriptive where
+  references are few (zones 2 and 6).
+
+### Causal ML for practice effects that vary by zone (planned, not run here)
+
+Practices are not randomly assigned. Farms that use cover crops differ in crop,
+texture and location. Causal ML adjusts for those confounders and estimates how
+each practice's effect varies by zone:
+
+* **Method:** causal forests (`grf::causal_forest`) or double/debiased ML
+  (`DoubleML`) for each binary practice (e.g., cover crop vs. none, no-till vs.
+  tilled) and each indicator.
+* **Confounders:** zone, texture/clay/sand, crop group, plant cycle, irrigation,
+  MAP/MAT, sampling depth, year, project. Lab indicators are never used as
+  predictors.
+* **Outputs:** average effect statewide and conditional effects by zone, with
+  confidence intervals, plus a formal test of whether effects differ across
+  zones.
+* **Checks:** propensity overlap and covariate balance in each zone. Where
+  overlap fails, report the effect as not estimable instead of producing a
+  number. Cluster by `producer_id` for repeated samples.
+* **Role:** this complements the mixed models. Practice effects are reported as
+  supported where both approaches agree in direction and size.
+
+## Synthesis: are the zones useful benchmarks?
+
+| Test | How | Zones are useful if… |
+|---|---|---|
+| Explanatory value | Compare k7 against other groupings: statewide, county, texture class, crop group | k7 explains more variance, or the same with fewer groups |
+| Benchmark accuracy | Score held-out fields (grouped by producer) against zone vs. statewide percentile benchmarks | Zone benchmarks reclassify fields in agronomically sensible ways |
+| Advice differs by zone | Practice × zone interaction (H3) | Practice effects differ by zone, so advice should too |
+| Stability | Zone medians and rankings across sampling years | Benchmarks are stable across 2020–2024 |
+
+## Sensitivity checks
+
+* Drop the 0–20 cm samples.
+* Drop the 2016–2019 DuPont data (`file_names == "2016-2019_dupont"`).
+* Use one sample per producer (most recent).
+* Rerun reference comparisons with strict vs. broad reference sets.
+
+# Session info
+
+```{r}
+#| label: session
+sessionInfo()
+```
+
